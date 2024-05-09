@@ -1887,6 +1887,9 @@ while ($i < $imaxinloop) {
 				$totalarray['nbfield']++;
 				$totalarray['pos'][$totalarray['nbfield']] = 'totalam';
 			}
+			if (empty($totalarray['val']['totalam'])) {
+				$totalarray['val']['totalam'] = 0;		// avoid PHP Warning:  Undefined array key "totalam" on line 1891
+			}
 			$totalarray['val']['totalam'] += $totalpay;
 		}
 
