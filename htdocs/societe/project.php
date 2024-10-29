@@ -83,6 +83,7 @@ if ($reshook < 0) {
 }
 
 $parameters = array('id'=>$socid);
+$arrayofmassactions = array(); // Prevent use of Undefined variable $arrayofmassactions in $form->selectMassAction('', $arrayofmassactions); 
 
 // List of mass actions available
 if (!empty($permissiontodelete)) {
