@@ -966,37 +966,156 @@ class ExpenseReports extends DolibarrApi
 			throw new RestException(403);
 		}
 
-		// Check mandatory fields
-		$result = $this->_validatepayment($request_data);
+		// Check mandatory fields.
+		$this->_validatepayment($request_data);
 
-		if (!is_array($request_data['amounts'])) {
-			throw new RestException(400, 'amounts field must be an array');
+		/*
+		 * When the bank module is enabled, the bank account must be known
+		 * before creating the payment.
+		 */
+		if (isModEnabled('bank') && empty($request_data['accountid'])) {
+			throw new RestException(
+				400,
+				'accountid field is required when bank module is enabled'
+			);
 		}
 
 		/*
-		 * Historically amounts was indexed by user ID.
+		 * Load the expense report referenced by the endpoint.
 		 *
-		 * This endpoint creates a payment for one expense report,
-		 * so preserve the total amount while converting the internal
-		 * representation to:
+		 * POST /expensereports/{id}/payments remains a payment
+		 * for one expense report for backward compatibility.
+		 */
+		$expensereport = new ExpenseReport($this->db);
+
+		$result = $expensereport->fetch((int) $id);
+		if ($result <= 0) {
+			throw new RestException(404, 'Expense report not found');
+		}
+
+		if (!DolibarrApi::_checkAccessToResource('expensereport', $expensereport)) {
+			throw new RestException(
+				403,
+				'Access not allowed for login '.DolibarrApiAccess::$user->login
+			);
+		}
+
+		if (
+			(int) $expensereport->status !== ExpenseReport::STATUS_APPROVED
+			|| !empty($expensereport->paid)
+		) {
+			throw new RestException(
+				403,
+				'Expense report is not available for payment'
+			);
+		}
+
+		/*
+		 * Validate payment amounts.
+		 */
+		if (
+			!isset($request_data['amounts'])
+			|| !is_array($request_data['amounts'])
+			|| count($request_data['amounts']) === 0
+		) {
+			throw new RestException(
+				400,
+				'amounts field must contain at least one amount'
+			);
+		}
+
+		/*
+		 * In Dolibarr <= 23, keys of "amounts" were historically used
+		 * as user IDs.
+		 *
+		 * Keep accepting this API format, but convert the total amount
+		 * to the new internal format:
 		 *
 		 *     expense_report_id => amount
 		 */
 		$totalamount = 0;
 
 		foreach ($request_data['amounts'] as $amount) {
-			$totalamount += (float) price2num($amount, 'MT');
+			$amount = (float) price2num($amount, 'MT');
+
+			if ($amount < 0) {
+				throw new RestException(
+					400,
+					'Payment amount must not be negative'
+				);
+			}
+
+			if ($amount != 0) {
+				$totalamount += $amount;
+			}
 		}
 
+		$totalamount = (float) price2num($totalamount, 'MT');
+
+		if ($totalamount == 0) {
+			throw new RestException(
+				400,
+				'Payment amount must not be zero'
+			);
+		}
+
+		/*
+		 * Check remaining amount before creating the payment.
+		 */
+		$sumpaid = $expensereport->getSumPayments();
+
+		if ($sumpaid < 0) {
+			throw new RestException(
+				500,
+				'Error retrieving previous payments: '.$expensereport->error
+			);
+		}
+
+		$remaintopay = price2num(
+			$expensereport->total_ttc - $sumpaid,
+			'MT'
+		);
+
+		if ($totalamount > $remaintopay) {
+			throw new RestException(
+				400,
+				'Payment amount is higher than the amount remaining to pay'
+			);
+		}
+
+		/*
+		 * Prepare payment.
+		 */
 		$paymentExpenseReport = new PaymentExpenseReport($this->db);
+
+		// Legacy field kept temporarily for compatibility.
 		$paymentExpenseReport->fk_expensereport = (int) $id;
+
+		/*
+		 * New N-N internal representation.
+		 */
 		$paymentExpenseReport->amounts = array(
 			(int) $id => $totalamount
 		);
 
+		/*
+		 * Copy the other API fields.
+		 * "amounts" was already normalized above.
+		 */
+		$protectedFields = array(
+			'amounts',
+			'accountid',
+			'fk_expensereport',
+			'amount',
+			'fk_bank',
+			'id',
+			'rowid',
+			'fk_user_creat',
+			'fk_user_modif',
+		);
+
 		foreach ($request_data as $field => $value) {
-			// Already normalized above.
-			if ($field === 'amounts' || $field === 'fk_expensereport') {
+			if (in_array($field, $protectedFields, true)) {
 				continue;
 			}
 
@@ -1007,7 +1126,24 @@ class ExpenseReports extends DolibarrApi
 			);
 		}
 
-		if ($paymentExpenseReport->create(DolibarrApiAccess::$user) < 0) {
+		/*
+		 * Keep payment, N-N allocation, bank transaction and final
+		 * expense-report status in the same database transaction.
+		 *
+		 * Dolibarr supports nested transaction levels, so the commits
+		 * performed by create() and setPaid() do not commit the outer
+		 * transaction.
+		 */
+		$this->db->begin();
+
+		/*
+		 * Create payment and N-N allocation.
+		 */
+		$result = $paymentExpenseReport->create(DolibarrApiAccess::$user);
+
+		if ($result < 0) {
+			$this->db->rollback();
+
 			throw new RestException(
 				500,
 				'Error creating paymentExpenseReport',
@@ -1018,8 +1154,11 @@ class ExpenseReports extends DolibarrApi
 			);
 		}
 
-		if (isModEnabled("bank")) {
-			$paymentExpenseReport->addPaymentToBank(
+		/*
+		 * Create bank transaction when bank module is enabled.
+		 */
+		if (isModEnabled('bank')) {
+			$result = $paymentExpenseReport->addPaymentToBank(
 				DolibarrApiAccess::$user,
 				'payment_expensereport',
 				'(ExpenseReportPayment)',
@@ -1027,7 +1166,58 @@ class ExpenseReports extends DolibarrApi
 				'',
 				''
 			);
+
+			if ($result < 0) {
+				$this->db->rollback();
+
+				throw new RestException(
+					500,
+					'Error adding expense report payment to bank: '.$paymentExpenseReport->error
+				);
+			}
 		}
+
+		/*
+		 * Mark the expense report as paid when the new payment
+		 * completes its balance.
+		 */
+		$sumpaid = $expensereport->getSumPayments();
+
+		if ($sumpaid < 0) {
+			$this->db->rollback();
+
+			throw new RestException(
+				500,
+				'Error retrieving payment total: '.$expensereport->error
+			);
+		}
+
+		$remaintopay = price2num(
+			$expensereport->total_ttc - $sumpaid,
+			'MT'
+		);
+
+		if ($remaintopay == 0) {
+			$result = $expensereport->setPaid(
+				$expensereport->id,
+				DolibarrApiAccess::$user
+			);
+
+			if ($result <= 0) {
+				$this->db->rollback();
+
+				throw new RestException(
+					500,
+					'Error setting expense report as paid: '.$expensereport->error
+				);
+			}
+		}
+
+		/*
+		 * Everything succeeded:
+		 * payment + allocations + bank line + bank_url + paid status.
+		 */
+		$this->db->commit();
 
 		return $paymentExpenseReport->id;
 	}
