@@ -939,8 +939,16 @@ class ExpenseReports extends DolibarrApi
 
 		$paymentExpenseReport = new PaymentExpenseReport($this->db);
 		$result = $paymentExpenseReport->fetch($pid);
-		if (!$result) {
+		if ($result <= 0 || empty($paymentExpenseReport->id)) {
 			throw new RestException(404, 'paymentExpenseReport not found');
+		}
+
+		$result = $paymentExpenseReport->fetchAmounts();
+		if ($result < 0) {
+			throw new RestException(
+				500,
+				'Error loading expense report payment allocations: '.$paymentExpenseReport->error
+			);
 		}
 
 		return $this->_cleanObjectDatas($paymentExpenseReport);
@@ -1052,28 +1060,225 @@ class ExpenseReports extends DolibarrApi
 			throw new RestException(403);
 		}
 
+		if ($request_data === null) {
+			$request_data = array();
+		}
+
 		$paymentExpenseReport = new PaymentExpenseReport($this->db);
 		$result = $paymentExpenseReport->fetch($id);
 
-		if (!$result) {
+		if ($result <= 0 || empty($paymentExpenseReport->id)) {
 			throw new RestException(404, 'payment of expense report not found');
 		}
 
-		foreach ($request_data as $field => $value) {
-			if ($field == 'id') {
-				continue;
+		$result = $paymentExpenseReport->fetchAmounts();
+		if ($result < 0) {
+			throw new RestException(
+				500,
+				'Error loading expense report payment allocations: '.$paymentExpenseReport->error
+			);
+		}
+
+		$oldamounts = $paymentExpenseReport->amounts;
+
+		if (empty($oldamounts)) {
+			throw new RestException(
+				500,
+				'Existing payment has no expense report allocation'
+			);
+		}
+
+		/*
+		 * Determine the owner of the existing payment.
+		 *
+		 * A multi-expense-report payment must remain attached to expense
+		 * reports belonging to the same user.
+		 */
+		$paymentuserid = 0;
+
+		foreach ($oldamounts as $expensereportid => $amount) {
+			$expensereport = new ExpenseReport($this->db);
+			$result = $expensereport->fetch((int) $expensereportid);
+
+			if ($result <= 0) {
+				throw new RestException(500, 'Error loading expense report of existing payment');
+			}
+
+			if (!DolibarrApi::_checkAccessToResource('expensereport', $expensereport)) {
+				throw new RestException(
+					403,
+					'Access not allowed to expense report '.$expensereportid
+				);
+			}
+
+			if (!$paymentuserid) {
+				$paymentuserid = (int) $expensereport->fk_user_author;
+			} elseif ($paymentuserid !== (int) $expensereport->fk_user_author) {
+				throw new RestException(
+					500,
+					'Existing payment contains expense reports belonging to different users'
+				);
+			}
+		}
+
+		$newamounts = null;
+
+		if (array_key_exists('amounts', $request_data)) {
+			if (!is_array($request_data['amounts']) || count($request_data['amounts']) === 0) {
+				throw new RestException(
+					400,
+					'amounts field must contain at least one expense report amount'
+				);
+			}
+
+			$newamounts = array();
+			$newtotalamount = 0;
+
+			foreach ($request_data['amounts'] as $expensereportid => $amount) {
+				$expensereportid = (int) $expensereportid;
+				$amount = (float) price2num($amount, 'MT');
+
+				if ($expensereportid <= 0) {
+					throw new RestException(400, 'Invalid expense report ID in amounts');
+				}
+
+				if ($amount < 0) {
+					throw new RestException(400, 'Payment amount must not be negative');
+				}
+
+				if ($amount == 0) {
+					continue;
+				}
+
+				$expensereport = new ExpenseReport($this->db);
+				$result = $expensereport->fetch($expensereportid);
+
+				if ($result <= 0) {
+					throw new RestException(
+						404,
+						'Expense report '.$expensereportid.' not found'
+					);
+				}
+
+				if (!DolibarrApi::_checkAccessToResource('expensereport', $expensereport)) {
+					throw new RestException(
+						403,
+						'Access not allowed to expense report '.$expensereportid
+					);
+				}
+
+				if (
+					(int) $expensereport->status !== ExpenseReport::STATUS_APPROVED
+					&& (
+						(int) $expensereport->status !== ExpenseReport::STATUS_CLOSED
+						|| empty($expensereport->paid)
+					)
+				) {
+					throw new RestException(
+						403,
+						'Expense report '.$expensereportid.' is not available for payment'
+					);
+				}
+
+				if (!$paymentuserid) {
+					$paymentuserid = (int) $expensereport->fk_user_author;
+				}
+
+				if ($paymentuserid !== (int) $expensereport->fk_user_author) {
+					throw new RestException(
+						400,
+						'All expense reports of a payment must belong to the same user'
+					);
+				}
+
+				$sumpaid = $expensereport->getSumPayments();
+
+				if ($sumpaid < 0) {
+					throw new RestException(
+						500,
+						'Error retrieving previous payments for expense report '.$expensereportid
+					);
+				}
+
+				/*
+				 * Remove this payment's current allocation before checking
+				 * how much may be assigned back to the expense report.
+				 */
+				$currentallocation = isset($oldamounts[$expensereportid])
+					? (float) price2num($oldamounts[$expensereportid], 'MT')
+					: 0;
+
+				$paidbyotherpayments = (float) price2num(
+					(float) $sumpaid - $currentallocation,
+					'MT'
+				);
+
+				$availableamount = (float) price2num(
+					(float) $expensereport->total_ttc - $paidbyotherpayments,
+					'MT'
+				);
+
+				if ($amount > $availableamount) {
+					throw new RestException(
+						400,
+						'Payment amount is higher than the amount remaining to pay for expense report '.$expensereportid
+					);
+				}
+
+				$newamounts[$expensereportid] = $amount;
+				$newtotalamount += $amount;
+			}
+
+			$newtotalamount = (float) price2num($newtotalamount, 'MT');
+
+			if ($newtotalamount == 0 || count($newamounts) === 0) {
+				throw new RestException(400, 'Payment amount must not be zero');
 			}
 
 			/*
-			 * These fields define the expense-report allocation.
-			 * Updating only the legacy payment row would make it
-			 * inconsistent with paymentexpensereport_expensereport.
+			 * Once a bank transaction exists, its amount must stay
+			 * synchronized with the payment total.
 			 */
-			if (in_array($field, array('fk_expensereport', 'amount', 'amounts'), true)) {
+			if (
+				!empty($paymentExpenseReport->fk_bank)
+				&& price2num($newtotalamount, 'MT') != price2num($paymentExpenseReport->amount, 'MT')
+			) {
+				throw new RestException(
+					400,
+					'Payment total cannot be changed after the bank transaction has been created'
+				);
+			}
+		}
+
+		$forbiddenFields = array(
+			'id',
+			'rowid',
+			'fk_expensereport',
+			'amount',
+			'fk_bank',
+			'fk_user_creat',
+			'fk_user_modif',
+			'accountid',
+		);
+
+		if (!empty($paymentExpenseReport->fk_bank)) {
+			$forbiddenFields[] = 'datep';
+			$forbiddenFields[] = 'fk_typepayment';
+			$forbiddenFields[] = 'num_payment';
+		}
+
+		foreach ($forbiddenFields as $field) {
+			if (array_key_exists($field, $request_data)) {
 				throw new RestException(
 					400,
 					'Field "'.$field.'" cannot be modified on an existing expense report payment'
 				);
+			}
+		}
+
+		foreach ($request_data as $field => $value) {
+			if ($field === 'amounts') {
+				continue;
 			}
 
 			$paymentExpenseReport->$field = $this->_checkValForAPI(
@@ -1083,11 +1288,119 @@ class ExpenseReports extends DolibarrApi
 			);
 		}
 
-		if ($paymentExpenseReport->update(DolibarrApiAccess::$user) > 0) {
-			return $this->get($id);
-		} else {
+		/*
+		 * PaymentExpenseReport::update() still persists the legacy "note"
+		 * property, so synchronize it after applying note_public from API.
+		 */
+		$paymentExpenseReport->note = $paymentExpenseReport->note_public;
+
+		$affectedexpensereports = array_unique(
+			array_merge(
+				array_keys($oldamounts),
+				$newamounts === null ? array() : array_keys($newamounts)
+			)
+		);
+
+		$this->db->begin();
+
+		$result = $paymentExpenseReport->update(DolibarrApiAccess::$user);
+
+		if ($result <= 0) {
+			$this->db->rollback();
 			throw new RestException(500, $paymentExpenseReport->error);
 		}
+
+		if ($newamounts !== null) {
+			$result = $paymentExpenseReport->updateAmounts(
+				$newamounts,
+				DolibarrApiAccess::$user
+			);
+
+			if ($result <= 0) {
+				$this->db->rollback();
+
+				throw new RestException(
+					500,
+					'Error updating expense report payment allocations: '.$paymentExpenseReport->error
+				);
+			}
+
+			/*
+			 * Recalculate paid status for every expense report affected
+			 * by the old or new allocation.
+			 */
+			foreach ($affectedexpensereports as $expensereportid) {
+				$expensereport = new ExpenseReport($this->db);
+				$result = $expensereport->fetch((int) $expensereportid);
+
+				if ($result <= 0) {
+					$this->db->rollback();
+
+					throw new RestException(
+						500,
+						'Error reloading expense report '.$expensereportid
+					);
+				}
+
+				$sumpaid = $expensereport->getSumPayments();
+
+				if ($sumpaid < 0) {
+					$this->db->rollback();
+
+					throw new RestException(
+						500,
+						'Error retrieving payment total for expense report '.$expensereportid
+					);
+				}
+
+				$remaintopay = price2num(
+					$expensereport->total_ttc - $sumpaid,
+					'MT'
+				);
+
+				if ($remaintopay < 0) {
+					$this->db->rollback();
+
+					throw new RestException(
+						500,
+						'Expense report '.$expensereportid.' became overpaid'
+					);
+				}
+
+				if ($remaintopay == 0 && empty($expensereport->paid)) {
+					$result = $expensereport->setPaid(
+						$expensereport->id,
+						DolibarrApiAccess::$user
+					);
+
+					if ($result < 0) {
+						$this->db->rollback();
+
+						throw new RestException(
+							500,
+							'Error setting expense report '.$expensereportid.' as paid'
+						);
+					}
+				} elseif ($remaintopay > 0 && !empty($expensereport->paid)) {
+					$result = $expensereport->setUnpaid(
+						DolibarrApiAccess::$user
+					);
+
+					if ($result < 0) {
+						$this->db->rollback();
+
+						throw new RestException(
+							500,
+							'Error setting expense report '.$expensereportid.' as unpaid'
+						);
+					}
+				}
+			}
+		}
+
+		$this->db->commit();
+
+		return $this->_cleanObjectDatas($paymentExpenseReport);
 	}
 
 	/**

@@ -341,6 +341,157 @@ class PaymentExpenseReport extends CommonObject
 		}
 	}
 
+
+	/**
+	 * Load expense report allocations of this payment.
+	 *
+	 * @return	int		Return integer <0 if KO, >=0 number of allocations if OK
+	 */
+	public function fetchAmounts()
+	{
+		$this->amounts = array();
+
+		if (empty($this->id)) {
+			$this->error = 'ErrorBadPaymentExpenseReportId';
+			return -1;
+		}
+
+		$sql = "SELECT fk_expensereport, amount";
+		$sql .= " FROM ".MAIN_DB_PREFIX."paymentexpensereport_expensereport";
+		$sql .= " WHERE fk_payment = ".((int) $this->id);
+
+		dol_syslog(get_class($this)."::fetchAmounts", LOG_DEBUG);
+		$resql = $this->db->query($sql);
+
+		if (!$resql) {
+			$this->error = $this->db->lasterror();
+			return -1;
+		}
+
+		while ($obj = $this->db->fetch_object($resql)) {
+			$this->amounts[(int) $obj->fk_expensereport] = (float) $obj->amount;
+		}
+
+		$this->db->free($resql);
+
+		return count($this->amounts);
+	}
+
+	/**
+	 * Replace expense report allocations of this payment.
+	 *
+	 * This also keeps the legacy payment total and expense report ID
+	 * synchronized with the N-N relation.
+	 *
+	 * @param	array<int,float|int|string>	$amounts	Amounts indexed by expense report ID
+	 * @param	User						$user		User making change
+	 * @return	int									Return integer <0 if KO, >0 if OK
+	 */
+	public function updateAmounts($amounts, $user)
+	{
+		$error = 0;
+		$newamounts = array();
+		$totalamount = 0;
+		$firstexpensereportid = 0;
+
+		foreach ($amounts as $expensereportid => $amount) {
+			$expensereportid = (int) $expensereportid;
+			$amount = (float) price2num($amount, 'MT');
+
+			if ($expensereportid <= 0) {
+				$this->error = 'ErrorBadExpenseReportId';
+				return -1;
+			}
+
+			if ($amount == 0) {
+				continue;
+			}
+
+			if (!$firstexpensereportid) {
+				$firstexpensereportid = $expensereportid;
+			}
+
+			$newamounts[$expensereportid] = $amount;
+			$totalamount += $amount;
+		}
+
+		$totalamount = (float) price2num($totalamount, 'MT');
+
+		// Keep the current legacy expense report reference when it is
+		// still part of the new allocation.
+		if (
+			!empty($this->fk_expensereport)
+			&& isset($newamounts[(int) $this->fk_expensereport])
+		) {
+			$firstexpensereportid = (int) $this->fk_expensereport;
+		}
+
+		if (!$firstexpensereportid || $totalamount == 0) {
+			$this->error = 'TotalAmountEmpty';
+			return -1;
+		}
+
+		$this->db->begin();
+
+		$sql = "DELETE FROM ".MAIN_DB_PREFIX."paymentexpensereport_expensereport";
+		$sql .= " WHERE fk_payment = ".((int) $this->id);
+
+		dol_syslog(get_class($this)."::updateAmounts", LOG_DEBUG);
+		if (!$this->db->query($sql)) {
+			$this->error = $this->db->lasterror();
+			$error++;
+		}
+
+		if (!$error) {
+			foreach ($newamounts as $expensereportid => $amount) {
+				$sql = "INSERT INTO ".MAIN_DB_PREFIX."paymentexpensereport_expensereport";
+				$sql .= " (fk_payment, fk_expensereport, amount,";
+				$sql .= " multicurrency_code, multicurrency_tx, multicurrency_amount)";
+				$sql .= " VALUES (";
+				$sql .= ((int) $this->id).",";
+				$sql .= ((int) $expensereportid).",";
+				$sql .= price2num($amount).",";
+				$sql .= " NULL,";
+				$sql .= " 1,";
+				$sql .= price2num($amount);
+				$sql .= ")";
+
+				if (!$this->db->query($sql)) {
+					$this->error = $this->db->lasterror();
+					$error++;
+					break;
+				}
+			}
+		}
+
+		if (!$error) {
+			$sql = "UPDATE ".MAIN_DB_PREFIX."payment_expensereport SET";
+			$sql .= " fk_expensereport = ".((int) $firstexpensereportid).",";
+			$sql .= " amount = ".price2num($totalamount).",";
+			$sql .= " fk_user_modif = ".((int) $user->id);
+			$sql .= " WHERE rowid = ".((int) $this->id);
+
+			if (!$this->db->query($sql)) {
+				$this->error = $this->db->lasterror();
+				$error++;
+			}
+		}
+
+		if ($error) {
+			$this->db->rollback();
+			return -1;
+		}
+
+		$this->fk_expensereport = $firstexpensereportid;
+		$this->amount = $totalamount;
+		$this->amounts = $newamounts;
+		$this->fk_user_modif = (int) $user->id;
+
+		$this->db->commit();
+
+		return 1;
+	}
+
 	// phpcs:disable Generic.CodeAnalysis.UnusedFunctionParameter
 	/**
 	 *  Update database
